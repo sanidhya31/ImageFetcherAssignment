@@ -1,11 +1,15 @@
 import requests
 from bs4 import BeautifulSoup
 import os
+import hashlib
 
 URL = "https://metamuseum.tumblr.com/page/1"
 
 SAVE_DIR = "images"
 os.makedirs(SAVE_DIR, exist_ok=True)
+
+def hash_content(content):
+    return hashlib.sha256(content).hexdigest()
 
 
 def download_image(session, url):
@@ -16,11 +20,18 @@ def download_image(session, url):
             print(f"[FAIL] {url}")
             return
 
-        filename = url.split("/")[-1]
+        content = response.content
+        file_hash = hash_content(content)
+
+        filename = f"{file_hash}.jpg"
         path = os.path.join(SAVE_DIR, filename)
 
+        if os.path.exists(path):
+            print(f"[SKIP] Already exists {filename}")
+            return
+
         with open(path, "wb") as f:
-            f.write(response.content)
+            f.write(content)
 
         print(f"[SAVED] {filename}")
 
