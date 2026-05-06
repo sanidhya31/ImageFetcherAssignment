@@ -1,28 +1,23 @@
-"""
-metamuseum_scraper.py
-"""
-
 import hashlib
-import json
 import logging
 import random
 import re
 import time
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
-from curl_cffi import requests  # replaces standard requests
+from curl_cffi import requests
 from bs4 import BeautifulSoup
 
-# ── Config ───────────────────────────────────────────────────────────────────
-BLOG_URL    = "https://metamuseum.tumblr.com"
-SAVE_DIR    = Path("images")
-LOG_FILE    = Path("fetch_log.jsonl")
-STATE_FILE  = Path("state.json")
-MAX_PAGES   = 50
-DELAY_MIN   = 2.0
-DELAY_MAX   = 4.0
+# ── Config ─────────────────────────────────────────
+BLOG_URL = "https://metamuseum.tumblr.com"
+SAVE_DIR = Path("images")
+DB_FILE = "fetcher.db"
+
+MAX_PAGES = 50
+DELAY_MIN = 2.0
+DELAY_MAX = 4.0
 MAX_RETRIES = 3
 
 HEADERS = {
@@ -36,156 +31,240 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%H:%M:%S",
 )
+
 log = logging.getLogger(__name__)
 
 
-# ── Structured fetch log (JSONL) ─────────────────────────────────────────────
-def log_fetch(url: str, status: Optional[int], success: bool, note: str = ""):
-    record = {
-        "ts":      datetime.now(timezone.utc).isoformat(),
-        "url":     url,
-        "status":  status,
-        "success": success,
-        "note":    note,
-    }
-    with LOG_FILE.open("a") as f:
-        f.write(json.dumps(record) + "\n")
+# ── DB SETUP ───────────────────────────────────────
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS fetch_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT,
+        url TEXT,
+        status INTEGER,
+        success INTEGER,
+        note TEXT
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS images (
+        hash TEXT PRIMARY KEY,
+        url TEXT,
+        saved_at TEXT
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS state (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )
+    """)
+
+    conn.commit()
+    return conn
 
 
-# ── State persistence ─────────────────────────────────────────────────────────
-def load_state() -> dict:
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
-    return {"last_page": 0, "seen_hashes": []}
+def log_fetch(conn, url, status, success, note=""):
+    cur = conn.cursor()
+
+    cur.execute(
+        "INSERT INTO fetch_log (ts, url, status, success, note) VALUES (?, ?, ?, ?, ?)",
+        (
+            datetime.now(timezone.utc).isoformat(),
+            url,
+            status,
+            int(success),
+            note,
+        ),
+    )
+
+    conn.commit()
 
 
-def save_state(state: dict):
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+def get_state(conn, key, default=0):
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT value FROM state WHERE key=?",
+        (key,)
+    )
+
+    row = cur.fetchone()
+
+    return int(row[0]) if row else default
 
 
-# ── Safe GET (curl_cffi impersonates Chrome at TLS level) ────────────────────
-def safe_get(session, url: str, params: dict = None):
+def set_state(conn, key, value):
+    cur = conn.cursor()
+
+    cur.execute(
+        "INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)",
+        (key, str(value)),
+    )
+
+    conn.commit()
+
+
+# ── Safe GET ───────────────────────────────────────
+def safe_get(session, conn, url):
     for attempt in range(1, MAX_RETRIES + 1):
+
         try:
             r = session.get(
                 url,
-                params=params,
                 headers=HEADERS,
                 timeout=15,
-                impersonate="chrome120",   # <-- bypasses Cloudflare TLS fingerprint
+                impersonate="chrome120",
             )
-            log_fetch(url, r.status_code, r.status_code == 200, f"attempt {attempt}")
+
+            log_fetch(
+                conn,
+                url,
+                r.status_code,
+                r.status_code == 200,
+                f"attempt {attempt}"
+            )
 
             if r.status_code == 200 and len(r.content) > 200:
                 return r
 
-            if r.status_code == 404:
-                log.info("404 – end of blog.")
-                return None
-
-            log.warning(f"[HTTP {r.status_code}] attempt {attempt}/{MAX_RETRIES}")
-
         except Exception as e:
-            log_fetch(url, None, False, f"exception: {e}")
-            log.warning(f"[ERR] attempt {attempt}/{MAX_RETRIES} – {e}")
+            log_fetch(conn, url, None, False, str(e))
 
-        if attempt < MAX_RETRIES:
-            time.sleep(2 * attempt + random.uniform(0.5, 1.5))
+        time.sleep(2 * attempt + random.uniform(0.5, 1.5))
 
     log.error(f"[FAILED] {url}")
+
     return None
 
 
-# ── Resolution upgrade ────────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────
+def hash_content(content):
+    return hashlib.sha256(content).hexdigest()
+
+
 def _upgrade_resolution(url: str) -> str:
     return re.sub(r"/s\d+x\d+/", "/s2048x3072/", url)
 
 
-# ── Extract image URLs from HTML ─────────────────────────────────────────────
-def extract_image_urls(html: str) -> set:
+def extract_image_urls(html):
     soup = BeautifulSoup(html, "html.parser")
     urls = set()
 
     for img in soup.find_all("img"):
         src = img.get("src", "")
+
         if "media.tumblr.com" in src:
             urls.add(_upgrade_resolution(src))
 
     for img in soup.find_all("img", srcset=True):
+
         for part in img["srcset"].split(","):
             candidate = part.strip().split(" ")[0]
+
             if "media.tumblr.com" in candidate:
                 urls.add(_upgrade_resolution(candidate))
 
     return urls
 
 
-# ── Download with deduplication ───────────────────────────────────────────────
-def download_image(session, url: str, seen_hashes: set) -> Optional[str]:
-    r = safe_get(session, url)
+# ── Download ───────────────────────────────────────
+def download_image(session, conn, url):
+    r = safe_get(session, conn, url)
+
     if not r:
-        return None
+        return False
 
-    h = hashlib.sha256(r.content).hexdigest()
+    h = hash_content(r.content)
 
-    if h in seen_hashes:
-        log.info(f"[SKIP] duplicate {h[:12]}...")
-        return None
+    cur = conn.cursor()
 
-    ext = url.split(".")[-1].split("?")[0].lower()
-    ext = ext if ext in ("jpg", "jpeg", "png", "gif", "webp") else "jpg"
+    cur.execute(
+        "SELECT 1 FROM images WHERE hash=?",
+        (h,)
+    )
+
+    if cur.fetchone():
+        return False
+
+    ext = url.split(".")[-1].split("?")[0]
 
     path = SAVE_DIR / f"{h}.{ext}"
-    if path.exists():
-        seen_hashes.add(h)
-        return None
 
     path.write_bytes(r.content)
-    seen_hashes.add(h)
-    log.info(f"[SAVED] {h[:12]}....{ext}  ({len(r.content) // 1024} KB)")
-    return h
+
+    cur.execute(
+        "INSERT INTO images (hash, url, saved_at) VALUES (?, ?, ?)",
+        (
+            h,
+            url,
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+
+    conn.commit()
+
+    log.info(f"[SAVED] {h[:10]}")
+
+    return True
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── MAIN ───────────────────────────────────────────
 def main():
     SAVE_DIR.mkdir(exist_ok=True)
 
-    state = load_state()
-    seen_hashes = set(state["seen_hashes"])
-    start_page = state["last_page"] + 1
+    conn = init_db()
 
-    # curl_cffi session — no headers in constructor, passed per-request
     session = requests.Session()
 
-    max_p = MAX_PAGES if MAX_PAGES is not None else 9999
+    start_page = get_state(conn, "last_page", 0) + 1
 
-    for page_num in range(start_page, max_p + 1):
-        url = f"{BLOG_URL}/page/{page_num}"
-        log.info(f"\n── Page {page_num} ──────────────────────")
+    for page in range(start_page, start_page + 1):
 
-        r = safe_get(session, url)
+        url = f"{BLOG_URL}/page/{page}"
+
+        log.info(f"\n── Page {page} ──────────────────────")
+
+        r = safe_get(session, conn, url)
+
         if not r:
-            log.info("Stopping.")
             break
 
         image_urls = extract_image_urls(r.text)
+
         log.info(f"Found {len(image_urls)} image URLs")
 
         if not image_urls:
-            log.info("Empty page – reached the end.")
+            log.info("Empty page → stopping")
             break
 
+        new_count = 0
+
         for img_url in image_urls:
-            time.sleep(DELAY_MIN + random.uniform(0, DELAY_MAX - DELAY_MIN))
-            download_image(session, img_url, seen_hashes)
 
-        state["last_page"] = page_num
-        state["seen_hashes"] = list(seen_hashes)
-        save_state(state)
+            time.sleep(
+                DELAY_MIN + random.uniform(0, DELAY_MAX - DELAY_MIN)
+            )
 
-        time.sleep(DELAY_MIN + random.uniform(0, 1.0))
+            if download_image(session, conn, img_url):
+                new_count += 1
 
-    log.info(f"\nDone. {len(seen_hashes)} unique images total.")
+        log.info(f"New images this page: {new_count}")
+
+        # ✅ KEY FIX: stop if nothing new
+        if new_count == 0:
+            log.info("No new images → stopping crawl")
+            break
+
+        set_state(conn, "last_page", page)
+
+    log.info("\nDone.")
 
 
 if __name__ == "__main__":
