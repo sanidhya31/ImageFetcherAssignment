@@ -10,7 +10,7 @@ from pathlib import Path
 from curl_cffi import requests
 from bs4 import BeautifulSoup
 
-# ── Config ─────────────────────────────────────────
+# ── Initial Configurations  ─────────────────────────────────────────
 BLOG_URL = "https://metamuseum.tumblr.com"
 SAVE_DIR = Path("images")
 DB_FILE = "fetcher.db"
@@ -35,15 +35,22 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ── DB SETUP ───────────────────────────────────────
+# ── DataBase SETUP - sqlite ───────────────────────────────────────
+
+# DB STAGE 1 - Creating database schema (structure)
 def init_db():
+
+    #Database - notebook
+    #Connection - opening that notebook
+    #Cursor - pen used to write / read
+
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS fetch_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts TEXT,
+        id INTEGER PRIMARY KEY AUTOINCREMENT, 
+        ts TEXT, 
         url TEXT,
         status INTEGER,
         success INTEGER,
@@ -69,6 +76,7 @@ def init_db():
     conn.commit()
     return conn
 
+# DB STAGE 2 - Storing the data
 
 def log_fetch(conn, url, status, success, note=""):
     cur = conn.cursor()
@@ -111,8 +119,9 @@ def set_state(conn, key, value):
     conn.commit()
 
 
-# ── Safe GET ───────────────────────────────────────
+# ── The Crawler ───────────────────────────────────────
 def safe_get(session, conn, url):
+
     for attempt in range(1, MAX_RETRIES + 1):
 
         try:
@@ -144,7 +153,7 @@ def safe_get(session, conn, url):
     return None
 
 
-# ── Helpers ────────────────────────────────────────
+# ── Helper functions ────────────────────────────────────────
 def hash_content(content):
     return hashlib.sha256(content).hexdigest()
 
